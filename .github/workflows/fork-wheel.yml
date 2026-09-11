@@ -1,0 +1,92 @@
+name: fork-wheel
+
+# Fork-only workflow. Exists on the `test-ci` scratch branch and nowhere else.
+#
+# The upstream `build` workflow cannot produce a wheel on a fork: its wheel jobs
+# request `[self-hosted, Linux, X64, build]` runners that a fork does not have,
+# and its `harden-runner` step runs with `egress-policy: block` against an
+# organization policy store the fork cannot read, so even `actions/checkout`
+# fails. This workflow builds the Linux x86_64 CPython 3.12 wheel on a
+# GitHub-hosted runner instead, using the same maturin version, the same feature
+# set from `python/pyproject.toml`, and the same `release` profile as upstream.
+
+on:
+  push:
+    branches:
+      - test-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: wheel - cp312 linux x86_64
+    # Pinned to 22.04 so the glibc floor matches the manylinux_2_35 wheels
+    # upstream publishes, rather than the narrower tag a newer image produces
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # https://github.com/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # https://github.com/actions/setup-python
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # https://github.com/astral-sh/setup-uv
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          channel="$(awk -F '"' '/^channel/ { print $2; exit }' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup default "$channel"
+          rustc --version
+          cargo --version
+
+      - name: Report build inputs
+        run: |
+          echo "glibc: $(ldd --version | head -1)"
+          echo "python: $(python --version)"
+          echo "maturin: $(bash scripts/maturin-version.bash)"
+          echo "package version: $(awk -F '"' '/^version = / { print $2; exit }' python/pyproject.toml)"
+
+      - name: Build wheel
+        working-directory: python
+        run: |
+          MATURIN_VERSION="$(bash ../scripts/maturin-version.bash)"
+          uv run --no-project --no-build --with "maturin==${MATURIN_VERSION}" -- \
+            maturin build --locked --release --out ../dist --interpreter python3.12
+
+      - name: Validate wheel name and tags
+        run: |
+          ls -l dist
+          bash scripts/ci/validate-wheel-upload.bash
+
+      - name: Verify the wheel installs and carries the refresh work
+        run: |
+          python -m venv /tmp/verify
+          /tmp/verify/bin/python -m pip install --quiet --upgrade pip
+          /tmp/verify/bin/python -m pip install --quiet dist/nautilus_trader-*.whl
+          /tmp/verify/bin/python - <<'PY'
+          import nautilus_trader
+          from nautilus_trader.adapters.hyperliquid import HyperliquidDataClientConfig
+
+          print("nautilus_trader", nautilus_trader.__version__)
+          config = HyperliquidDataClientConfig()
+          print("update_instruments_interval_mins", config.update_instruments_interval_mins)
+          assert config.update_instruments_interval_mins == 60
+          PY
+
+      # https://github.com/actions/upload-artifact
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-cp312-linux-x86_64
+          path: dist/nautilus_trader-*.whl
+          if-no-files-found: error
+          retention-days: 30
