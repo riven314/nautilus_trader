@@ -1,0 +1,61 @@
+name: cancel-rejection-wheel
+
+on:
+  push:
+    branches:
+      - riven314/build-cancel-rejection-wheels
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: nautechsystems/nautilus_trader
+          ref: 5413bc7bad4f1773231c6aa7e7d7f6b37a2d6b3a
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          channel="$(awk -F '"' '/^channel/ { print $2; exit }' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup default "$channel"
+      - name: Identify pinned upstream build
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = 5413bc7bad4f1773231c6aa7e7d7f6b37a2d6b3a
+          sed -i 's/^version = "2.0.0rc7"$/version = "2.0.0rc7+g5413bc7"/' python/pyproject.toml
+      - name: Build release wheel
+        working-directory: python
+        shell: bash
+        run: |
+          version="$(bash ../scripts/maturin-version.bash)"
+          uv run --no-project --no-build --with "maturin==${version}" -- \
+            maturin build --locked --release --out ../dist --interpreter python3.13
+      - name: Verify isolated wheel installation
+        shell: bash
+        run: |
+          python -m venv /tmp/verify-cancel-wheel
+          /tmp/verify-cancel-wheel/bin/python -m pip install dist/*.whl
+          /tmp/verify-cancel-wheel/bin/python - <<'PY'
+          import nautilus_trader
+          from nautilus_trader.adapters.hyperliquid import HyperliquidDataClientConfig
+          assert nautilus_trader.__version__ == "2.0.0rc7+g5413bc7"
+          assert HyperliquidDataClientConfig().update_instruments_interval_mins == 60
+          print("Verified", nautilus_trader.__version__)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cancel-rejection-cp313-linux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
